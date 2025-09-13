@@ -4,10 +4,6 @@ A Model Context Protocol (MCP) server for Pi-hole. This server exposes Pi-hole f
 
 ## Dependencies
 
-### Docker
-
-- [Docker install guide](https://docs.docker.com/engine/install/)
-
 ### `uv` (Optional, for Development)
 
 If you want to run the application locally, use `uv`. Install it with your package manager of choice.
@@ -51,9 +47,6 @@ The project follows a modular organization for better maintainability:
 ├── resources/             # MCP resources
 │   ├── __init__.py
 │   └── common.py          # Common resources (piholes://, version://)
-├── docker-compose.yml     # Docker Compose configuration for production
-├── docker-compose.dev.yml # Docker Compose for development with volume mounts
-└── Dockerfile             # Docker build configuration
 ```
 
 This structure separates the code into logical components while maintaining compatibility with all run modes.
@@ -76,14 +69,6 @@ chmod +x install_service.sh
 ./install_service.sh
 ```
 The server will be available at `http://localhost:8812`
-
-### Development Mode with Docker
-
-For development, use the dev compose file which builds locally:
-
-```bash
-docker-compose -f docker-compose.dev.yml up
-```
 
 ### MCP Inspector
 
