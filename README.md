@@ -62,14 +62,20 @@ This structure separates the code into logical components while maintaining comp
 
 There are several ways to run the Pi-hole MCP server:
 
-### Using Docker (Recommended for Production)
+### Using systemctl service (Recommended for Production)
 
 ```bash
 # Standard deployment
-docker-compose up -d
+git clone https://github.com/mmakam2/pihole-mcp-server.git
+cd pihole-mcp-server
 ```
+Edit `.env` file for your specific pihole endpoints and passwords/api keys.
 
-The server will be available at `http://localhost:8383`
+```bash
+chmod +x install_service.sh
+./install_service.sh
+```
+The server will be available at `http://localhost:8812`
 
 ### Development Mode with Docker
 
