@@ -1,0 +1,5 @@
+
+fastapi>=0.111
+uvicorn>=0.34
+pydantic>=2.8
+mcp[cli]>=1.14
