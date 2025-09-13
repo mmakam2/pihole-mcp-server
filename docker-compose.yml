@@ -1,9 +1,0 @@
----
-services:
-  pihole-mcp:
-    image: sbarbett/pihole-mcp-server:latest
-    ports:
-      - "8383:8000"
-    env_file:
-      - .env
-    restart: unless-stopped 
