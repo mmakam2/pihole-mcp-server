@@ -1,8 +1,8 @@
 """
-FastAPI OpenAPI wrapper for your MCP server (no Docker)
-- Shim: auto-drop ANY unsupported FastMCP.__init__ kwargs (version, description, etc.)
-- Capture tools by monkeypatching FastMCP.tool() BEFORE importing your project
-- Deep-probe to find tools; fallback to main.EXPOSED_TOOLS (explicit dict)
+FastAPI OpenAPI wrapper for your MCP project (no Docker)
+- Captures ALL tools registered via @mcp.tool(...)
+- Tolerates older FastMCP ctor kwargs (filters unknown)
+- Uses FastAPI shutdown hook to call your project's close_pihole_sessions()
 - Endpoints: /healthz, /tools, /call_tool, /debug/introspect
 """
 import asyncio
@@ -13,13 +13,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# ===== Robust compatibility shim for FastMCP ctor AND capture of @mcp.tool =====
 CAPTURED_TOOLS: Dict[str, Any] = {}
 
+# ---- Patch FastMCP before importing your project: drop unknown __init__ kwargs + capture @tool ----
 try:
     from mcp.server.fastmcp import FastMCP as _FastMCP
 
-    # 1) Filter unknown kwargs on __init__
+    # Filter unknown kwargs for ctor
     _orig_init = _FastMCP.__init__
     _allowed_ctor = set(inspect.signature(_orig_init).parameters.keys())
 
@@ -31,65 +31,51 @@ try:
 
     _FastMCP.__init__ = _patched_init  # type: ignore[attr-defined]
 
-    # 2) Wrap .tool() to capture all registered tools
+    # Capture tool registrations
     _orig_tool = getattr(_FastMCP, "tool", None)
-
     if callable(_orig_tool):
         def _patched_tool(self, *targs, **tkwargs):
-            """
-            Intercepts tool registration:
-              @mcp.tool(name="list_queries") -> capture name & function
-            """
-            orig_decorator = _orig_tool(self, *targs, **tkwargs)
-
-            def decorator(func):
-                # Determine the tool name
+            orig_deco = _orig_tool(self, *targs, **tkwargs)
+            def deco(func):
                 tool_name = tkwargs.get("name")
                 if not tool_name:
-                    # Some flavors pass name via first arg or default to func.__name__
                     if targs and isinstance(targs[0], str):
                         tool_name = targs[0]
                     else:
-                        tool_name = getattr(func, "__name__", None) or "unnamed_tool"
-
-                # Record callable
+                        tool_name = getattr(func, "__name__", "unnamed_tool")
                 if callable(func):
                     CAPTURED_TOOLS[tool_name] = func
-
-                # Continue with original registration
-                return orig_decorator(func)
-
-            return decorator
-
+                return orig_deco(func)
+            return deco
         _FastMCP.tool = _patched_tool  # type: ignore[attr-defined]
 except Exception:
-    # If mcp isn't installed yet, start script installs it; import below will then work.
+    # mcp gets installed by your start script; if import failed here, the below import will also fail
     pass
 
-# ===== Import your project AFTER the patches so all tools are captured =====
+# ---- Import your project AFTER patches so tools get captured ----
 try:
-    import main as pihole_mcp_main
+    import main as project_main
 except Exception as e:
     raise RuntimeError(f"Failed to import your MCP server 'main.py': {e}")
 
-mcp = getattr(pihole_mcp_main, "mcp", None)
+mcp = getattr(project_main, "mcp", None)
 if mcp is None:
-    raise RuntimeError("Could not find 'mcp' instance in main.py. Ensure main.py defines FastMCP as 'mcp' at module scope.")
+    raise RuntimeError("Could not find 'mcp' instance in main.py. Ensure main.py defines FastMCP as 'mcp'.")
 
-# ---------- Tool discovery helpers ----------
+# ---- If needed, probe internal registries (fallback) ----
 def _looks_like_tool_object(obj: Any) -> Tuple[str, Any] | None:
     if callable(obj) and hasattr(obj, "__name__"):
         return (obj.__name__, obj)
-    for handler_attr in ("handler", "func", "callable", "fn"):
+    for attr in ("handler", "func", "callable", "fn"):
         name = getattr(obj, "name", None)
-        handler = getattr(obj, handler_attr, None)
+        handler = getattr(obj, attr, None)
         if isinstance(name, str) and callable(handler):
             return (name, handler)
     if isinstance(obj, (tuple, list)) and len(obj) == 2 and isinstance(obj[0], str) and callable(obj[1]):
         return (obj[0], obj[1])
     return None
 
-def _collect_from_container(container: Any, out: Dict[str, Any]) -> None:
+def _collect(container: Any, out: Dict[str, Any]) -> None:
     if isinstance(container, dict):
         for k, v in container.items():
             if isinstance(k, str):
@@ -120,68 +106,76 @@ def _collect_from_container(container: Any, out: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-def _probe_tool_registry(root: Any) -> Dict[str, Any]:
-    candidates: List[Any] = []
+def _probe(root: Any) -> Dict[str, Any]:
+    cands = []
     for attr in ("tools", "_tools", "registered_tools", "tool_registry", "registry", "router"):
-        candidates.append(getattr(root, attr, None))
+        cands.append(getattr(root, attr, None))
     for parent_attr in ("server", "_server", "app"):
-        parent = getattr(root, parent_attr, None)
-        if parent is None:
+        p = getattr(root, parent_attr, None)
+        if p is None:
             continue
-        candidates.append(parent)
+        cands.append(p)
         for attr in ("tools", "_tools", "registered_tools", "tool_registry", "registry", "router"):
-            candidates.append(getattr(parent, attr, None))
+            cands.append(getattr(p, attr, None))
     seen = set()
-    flat: List[Any] = []
-    for c in candidates:
-        if c is None:
-            continue
-        if id(c) in seen:
-            continue
-        seen.add(id(c))
-        flat.append(c)
-
+    flat = []
+    for x in cands:
+        if x is None: continue
+        if id(x) in seen: continue
+        seen.add(id(x)); flat.append(x)
     found: Dict[str, Any] = {}
-    for c in flat:
-        _collect_from_container(c, found)
-        for subname in ("tools", "_tools", "items", "values"):
+    for x in flat:
+        _collect(x, found)
+        for sub in ("tools", "_tools", "items", "values"):
             try:
-                sub = getattr(c, subname, None)
-                if callable(sub):
-                    sub = sub()
-                if sub is not None:
-                    _collect_from_container(sub, found)
+                subval = getattr(x, sub, None)
+                if callable(subval):
+                    subval = subval()
+                if subval is not None:
+                    _collect(subval, found)
             except Exception:
                 pass
     return found
 
-# 1) Prefer captured tools (from patched @mcp.tool)
+# Build tool map: captured → probed → EXPOSED_TOOLS fallback
 TOOL_MAP: Dict[str, Any] = dict(CAPTURED_TOOLS)
-
-# 2) If nothing captured, try probing internal registries
 if not TOOL_MAP:
-    TOOL_MAP = _probe_tool_registry(mcp)
-
-# 3) Fallback to explicit export if provided
+    TOOL_MAP = _probe(mcp)
 if not TOOL_MAP:
-    fallback = getattr(pihole_mcp_main, "EXPOSED_TOOLS", None)
+    fallback = getattr(project_main, "EXPOSED_TOOLS", None)
     if isinstance(fallback, dict) and fallback:
         TOOL_MAP = {k: v for k, v in fallback.items() if isinstance(k, str) and callable(v)}
-
 if not TOOL_MAP:
-    raise RuntimeError("Unable to locate any tools: capture failed, registry not found, and no EXPOSED_TOOLS provided.")
+    raise RuntimeError("No tools found (capture failed, no registry, and no EXPOSED_TOOLS).")
 
-# ---------- FastAPI app ----------
+# ---- FastAPI app ----
 app = FastAPI(
     title="Pi-hole MCP OpenAPI Wrapper",
     description="HTTP facade that calls MCP tools in-process",
-    version="0.2.0",
+    version="0.3.0",
 )
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+# Shutdown hook: call your project's cleanup
+_close_fn = getattr(project_main, "close_pihole_sessions", None)
+_async_cleanup = getattr(project_main, "async_cleanup", None)  # optional
+_shutdown = getattr(project_main, "_shutdown", None)           # optional
+
+@app.on_event("shutdown")
+async def _do_cleanup():
+    try:
+        for candidate in (_shutdown, _async_cleanup):
+            if candidate and inspect.iscoroutinefunction(candidate):
+                await candidate()
+                return
+        if callable(_close_fn):
+            await asyncio.to_thread(_close_fn)
+    except Exception as e:
+        print(f"[wrapper] cleanup error: {e}")
 
 class CallRequest(BaseModel):
     tool: str = Field(..., description="Name of the MCP tool to call")
@@ -200,8 +194,8 @@ async def debug_introspect():
     return {
         "captured_count": len(CAPTURED_TOOLS),
         "captured_keys": sorted(CAPTURED_TOOLS.keys()),
-        "probe_count": len(_probe_tool_registry(mcp)),
-        "fallback_keys": sorted((getattr(pihole_mcp_main, "EXPOSED_TOOLS", {}) or {}).keys()),
+        "probe_count": len(_probe(mcp)),
+        "fallback_keys": sorted((getattr(project_main, "EXPOSED_TOOLS", {}) or {}).keys()),
     }
 
 @app.post("/call_tool")
@@ -209,6 +203,8 @@ async def call_tool(req: CallRequest):
     func = TOOL_MAP.get(req.tool)
     if func is None:
         raise HTTPException(status_code=404, detail=f"Tool '{req.tool}' not found")
+
+    # Build kwargs from signature
     try:
         sig = inspect.signature(func)
         kwargs = {}
@@ -220,6 +216,8 @@ async def call_tool(req: CallRequest):
                     raise HTTPException(status_code=400, detail=f"Missing required parameter: {p.name}")
     except (ValueError, TypeError):
         kwargs = dict(req.args)
+
+    # Call sync/async tools
     try:
         if inspect.iscoroutinefunction(func):
             result = await func(**kwargs)
@@ -229,4 +227,5 @@ async def call_tool(req: CallRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Tool '{req.tool}' raised an error: {e}")
+
     return {"tool": req.tool, "result": result}
